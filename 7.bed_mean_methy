@@ -1,0 +1,408 @@
+#!/usr/bin/perl
+#--------------------------------------------------------------------------
+# This program is Copyright(C) 2015-20, Xinyu Wang (wangxinyuhs@126.com)
+#
+# This program is part of iBSTools.
+#
+# iBSTools is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# iBSTools is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with the program.  If not, see <http://www.gnu.org/licenses/>.
+#--------------------------------------------------------------------------
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename;
+
+our $VERSION = "1.3.0";
+=steps
+	1. calculation mean methylation for reference regions.
+=cut
+
+# params control
+my (
+	$help,
+
+	$reference,					#a predefined region, require chr, start, end.
+
+	$wl,						#input,wig file lists. each line represents a sample.
+
+	$outfile,					#output file. 
+);
+
+my $ref_head = 0;				#reference has a head?, default: 0
+my $infor_CG_threshold = 1;
+
+GetOptions(
+	'help|man|h'       => \$help,
+	
+	'r|reference=s'	   => \$reference,
+	'rh|ref_head'	   => \$ref_head,
+
+	'c|CG_nums=s'		   => \$infor_CG_threshold,
+
+	'w|wig_list=s'  => \$wl,
+
+	'o|outfile=s'       => \$outfile,
+
+);
+
+print_helpfile() if($help);
+required_args($reference, $wl, $outfile);
+
+welcome();
+
+warn call_time()."Read reference bed region: $reference\n";
+my $chr_ref_hs_ref = bed_chr_split( $reference , $ref_head );  # chr =>  [start , end]
+
+warn call_time()."Calculate mean methylation for each region. And print into a matrix.\n";
+my $methy_matrix_ref = cal_mean_methy( $outfile, $wl, $chr_ref_hs_ref , $infor_CG_threshold );
+
+warn call_time()."Completed!\n";
+goodbye();
+
+#calculation mean methylation for reference regions 
+#wig_chr_split REQUIRED
+#get_methylation REQUIRED
+sub cal_mean_methy{
+	my ( $outfile, $wig_list , $chr_ref_hs_ref , $infor_CG_threshold ) = @_;
+
+	my @sample_wig_files = get_sample_wigs($wig_list);
+
+	my %methy_matrix_hs = ();
+
+	foreach my $sample_i(0..$#sample_wig_files){  #for each sample. 
+		warn call_time(1)."Calculate mean methylation for $sample_wig_files[$sample_i]\n";
+		my ( $chr_site_hs_ref , $chr_methy_hs_ref ) = wig_chr_split( $sample_wig_files[$sample_i] );
+
+		foreach my $chr(sort keys %{ $chr_ref_hs_ref } ){ #calculate mean methylation for each chromosome.
+			my $methy_arr_ref = "";
+			if(exists $chr_site_hs_ref -> {$chr}){
+				$methy_arr_ref = get_methylation( $chr_ref_hs_ref -> {$chr} , $chr_site_hs_ref -> {$chr},
+								 				    $chr_methy_hs_ref -> {$chr} , $infor_CG_threshold );
+			}
+			else{ #didn't has signals
+				my @base_methy = ("NA") x scalar @{ $chr_ref_hs_ref -> {$chr} }; #initialization
+				$methy_arr_ref = \@base_methy;
+			}
+
+			unless ( $methy_matrix_hs{$chr} ){
+				$methy_matrix_hs{$chr} = {};
+			}
+			
+			$methy_matrix_hs{$chr} -> {$sample_i} = $methy_arr_ref;
+		}
+	}
+
+	#print 
+	warn call_time(1)."Now print into a matrix!\n";
+	open OUT,">","$outfile" or die "$! $outfile\n";
+	
+	##print head line
+	print OUT "chr\tstart\tend";
+	foreach my $sample_path(@sample_wig_files){
+		my $sample_name = fileparse($sample_path,".wig");
+		print OUT "\t".$sample_name;
+	}
+	print OUT "\n";
+
+	##print matrix
+	foreach my $chr( sort keys %{ $chr_ref_hs_ref } ){
+		my $bed_ref_arr_ref = $chr_ref_hs_ref -> {$chr};
+		
+		foreach my $region_i( 0 .. $#$bed_ref_arr_ref ){
+			print OUT "$chr\t$$bed_ref_arr_ref[$region_i][0]\t$$bed_ref_arr_ref[$region_i][1]";
+
+			foreach my $sample_i(0..$#sample_wig_files){
+				my $methy_arr_ref = $methy_matrix_hs{$chr} -> {$sample_i};
+				if($$methy_arr_ref[$region_i]){
+					print OUT "\t".$$methy_arr_ref[$region_i];
+				}
+				else{
+					warn "$chr\t$region_i\t$sample_i\n";
+				}
+				
+			}
+			print OUT "\n";
+		}
+	}
+	close OUT;
+
+	return 1;
+}
+
+
+=DESCRIPTION wig_chr_split  	[ INDEPENDENT ]
+    * Name: wig_chr_split
+    * Function: split file into chr arrs.
+    * Params: $infile
+    * Return: \@chr_methy_arrs , \@chr_site_arrs
+    * Independence: [ INDEPENDENT ]
+=cut
+
+sub wig_chr_split{
+	my ( $infile ) = @_;
+
+	my $in_fh;
+	if( $infile =~ /gz$/ ){
+		open $in_fh,"zcat $infile |" or die $infile."\nwig file open error, Please check up this path!\n";
+	}
+	elsif( $infile =~ /wig$/ ){
+		open $in_fh,"<",$infile or die $infile."\nwig file open error, Please check up this path!\n";
+	}
+	else{
+		die "ERROR: $infile is not .wig or .gz file.\n";
+	}
+	
+	my %chr_site_hs  = ();
+	my %chr_methy_hs = ();
+
+	my $chr = "0";
+	while( <$in_fh> ){
+		next if(/track type/);
+		s/[\r\n]$//g;
+		if(/chrom/){ 	#declaration line
+			my @declaration_arrs = split /\s+/;
+			$chr = substr( $declaration_arrs[1], 6 ); #get chr from declaration line, eg. variableStep chrom=chr1
+			$chr_site_hs{$chr}  = [];
+			$chr_methy_hs{$chr} = [];
+		}
+		else{
+			my @arr = split ;
+			push @{ $chr_site_hs{$chr}  } , $arr[0];
+			push @{ $chr_methy_hs{$chr} } , $arr[1];
+		}
+	}
+	close $in_fh;
+	return ( \%chr_site_hs , \%chr_methy_hs );
+}
+
+=DESCRIPTION bed_chr_split  	[ INDEPENDENT ]
+    * Name: bed_chr_split
+    * Function: split bed file into chr arrs.
+    * Params: $infile , $has_head
+    * Return: \@chr_bed_hs
+    * Independence: [ INDEPENDENT ]
+=cut
+
+sub bed_chr_split{
+	my ( $infile , $has_head ) = @_;
+	open my $in_fh,"<",$infile or die $infile."\nBed region open error,Please check up this path!\n";
+	
+	#delete the head 
+	if($has_head){
+		<$in_fh>;
+	}
+	
+	my %chr_bed_hs  = ();
+
+	my $chr = "";
+	while( <$in_fh> ){
+		s/[\r\n]$//g;
+		my @arr = split;
+		my ( $curChr, $start, $end ) = @arr[0, 1, 2];
+
+		if($curChr ne $chr){  	# new chromosome
+			$chr = $curChr;
+			$chr_bed_hs{$chr}  = [];
+			push @{ $chr_bed_hs{$chr} } , [ $arr[1], $arr[2] ];
+		}
+		else{
+			push @{ $chr_bed_hs{$chr} } , [ $arr[1], $arr[2] ];
+		}
+	}
+	close $in_fh;
+	return \%chr_bed_hs ;
+}
+
+=DESCRIPTION get_sample_wigs			[ INDEPENDENT ]
+Goal: get sample wiggle list file. (only non null line)
+Usage: get_sample_wigs(wig_list_file)
+Return: @sample_wig_files
+=cut
+sub get_sample_wigs{
+	my ( $wig_list ) = @_ ;
+
+	my @sample_wig_files = ();
+	if( $wig_list =~ /,/ ){ #mutiple wig file
+		@sample_wig_files = split /,/,$wig_list;
+	}
+	elsif( $wig_list =~ /wig$/ or $wig_list =~ /wig\.gz$/){ #single wig file
+		push @sample_wig_files, $wig_list;
+	}
+	elsif( -e $wig_list ){ #file exists, and not a wig file.
+		open FL,"<",$wig_list or die "$wig_list \n wig file open error, Please check up this path!";
+		
+		while(<FL>){
+			s/[\r\n]$//g;
+			if($_ ne ""){
+				push @sample_wig_files, $_;
+			}
+		}
+		
+		close FL;
+	}
+	else{
+		die "wig lists must be a file or a string seperated by comma.\n";
+	}
+	return @sample_wig_files;
+}
+
+=Data Description
+@Base (sorted)
+12  33
+45	65
+@Methy (sorted)
+123	0.12
+355	0.43
+=cut
+=Usage
+my $ref = getMethylation(\@region,\@site,\@methy);
+foreach my $i(@$ref){
+	print $i."\n";
+}
+#date: 24/6/2016
+=cut
+#get_methylation(\@region,\@site,\@methy)
+sub get_methylation{
+	my ( $region_ref, $site_ref, $methy_ref, $infor_CG_threshold ) = @_;
+	
+	my @base_methy = ("NA") x scalar @$region_ref; #initialization
+	
+	my $site_index = 0;
+	my $first_right_site_index =0;
+
+	foreach my $i(0..$#$region_ref){
+		my ( $start , $end ) = ( $$region_ref[$i][0] , $$region_ref[$i][1] );
+		
+		my ( $sum , $num ) = ( 0 , 0 );
+
+		while( $$site_ref[$site_index] < $start ){
+			last if ( $site_index >= $#$site_ref );
+			$site_index ++;
+		}#end: maybe the first site in region. (>= start)
+		$first_right_site_index = $site_index ; #mark first mapping site
+
+		while( $$site_ref[$site_index] <= $end ){	#all sites in region. ( >= start and <= end )
+			last if ( $site_index >= $#$site_ref );
+
+			$sum += $$methy_ref[$site_index] ;
+			$num ++;
+			$site_index ++;
+		}#end: out region
+		
+		if($num >= $infor_CG_threshold){		#there must be more than $infor_CG_threshold CpG sites.
+			$base_methy[$i] = sprintf("%.3f", $sum/$num );
+		}
+		
+		$site_index = $first_right_site_index ; #to return first mapping site
+	}
+	
+	return \@base_methy;
+}
+
+sub print_helpfile{
+	print qq(
+bed_mean_methy VERSION: $VERSION
+---------------------------------- H E L P ---------------------------------------
+"bed_mean_methy" help you caluculate mean methylation for predefined genomic regions.
+
+-------------------
+USAGE:	bed_mean_methy [OPTION] [-r <file>] [-w <file>] [-o <folder>]
+-------------------
+ARGUMENTS:
+	--help,--man,-h
+				display the helpfile.
+ OPTION:
+	-rh,--ref_head
+				reference bed file has head. DEFAULT: 0 (has no head). 1 means has head.
+	-c,--CG_nums
+				The CG number threshold of regions. The regions with CG number less than the threshold will set to NA. DEFAULT: 1.
+	
+ I/O:
+	-r
+				(REQUIRED) The path of predefined regions (required sorted). The first three columns must be: chromosome, start, end.
+	-w,--wig_list
+				(REQUIRED) The input file list of methylation level, each line indicates a sample. Or files string seperated by comma.Requires wiggle format(".wig") or compressed wiggle format(".wig.gz").
+	-o,--outfile
+				(REQUIRED) The output filename. 
+
+-------------------
+EXAMPLE:
+ BRIEF:
+	bed_mean_methy -r promoter.bed -w tissue.txt -o promoter_matrix.txt 
+	  get mean methylation for a each genomic region in promoter.bed.
+	  	 
+ OUTPUT:
+
+-------------------------------------------------------------------------------
+);
+	die "\n";
+}
+
+sub outdir_control{		#( string folder )
+	my $outdir = $_[0];
+	
+	unless(-e $outdir){	
+		mkdir $outdir or die "Can't create $outdir!\nPlease check up this path.\n";
+	}
+}
+
+sub indir_control{		#( string folder )
+	my $indir = $_[0];
+	
+	unless(-e $indir and -d $indir){		
+		die "$indir open error!\nPlease check up this path.\n";
+	}
+}
+
+sub required_args{		#( @array )
+	my @arr = @_;
+	
+	foreach my $args(@arr){
+		unless($args){
+			print "Lack required arguments.\n";
+			print_helpfile();
+		}
+	}
+}
+
+sub welcome{
+	my $username = $ENV{'LOGNAME'};
+	my $pwd = $ENV{'PWD'};
+	my $tool_name = $0;
+
+	warn "----------------------------------------------------\n";
+	warn "Hello! $username. Welcome to use $tool_name!\n";
+	warn "Working directory: $pwd.\n";
+	warn "\n";
+}
+
+sub goodbye{
+	warn "\n";
+	warn "Thanks for your use. If you have any question or advice, feel free to contact us.\n";
+	warn "----------------------------------------------------\n";
+}
+
+#get current time [hour:min:sec month,mday]
+sub call_time{
+	my $tab_nums = 0; #DEFAULT: has no tab 
+	$tab_nums = $_[0] if ($_[0]);
+
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime;
+	my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+	#my @weeks = qw(Sun Mon Tue Wed Thu Fri Sat);
+	#$year += 1900;
+	
+	return "[$hour:$min:$sec $months[$mon],$mday] ".("   " x $tab_nums);
+}
+
